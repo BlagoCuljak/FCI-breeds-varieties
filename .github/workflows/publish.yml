@@ -1,0 +1,78 @@
+name: Publish catalogue
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-catalogue
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check deployment configuration
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo 'Set CLOUDFLARE_ACCOUNT_ID secret'; exit 1; }
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Set CLOUDFLARE_API_TOKEN secret'; exit 1; }
+      - run: uv sync --locked
+      - run: npm ci
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run pytest
+      - name: Fetch, validate and build
+        run: |
+          mkdir -p artifacts
+          previous=tests/fixtures/catalogue.json
+          if [ -n "$API_BASE_URL" ]; then
+            curl --fail --silent --show-error --retry 3 --max-time 60 \
+              "${API_BASE_URL%/}/api/v1/breeds.json" -o artifacts/previous.json
+            previous=artifacts/previous.json
+          fi
+          uv run fci-breeds scrape --previous "$previous" --output artifacts/snapshot.json
+          uv run fci-breeds export artifacts/snapshot.json --output dist
+      - run: npm run check
+      - name: Smoke test before publishing
+        run: |
+          npm run dev > /tmp/wrangler.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" || true' EXIT
+          uv run python scripts/smoke.py http://localhost:8787
+      - name: Deploy complete snapshot
+        id: deploy
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run deploy 2>&1 | tee artifacts/deploy.log
+          uv run python scripts/deployment_url.py artifacts/deploy.log >> "$GITHUB_OUTPUT"
+      - name: Verify published API
+        env:
+          DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          uv run python scripts/smoke.py "$DEPLOYED_URL" --expected-meta dist/api/v1/meta.json
+          echo "Published catalogue: $DEPLOYED_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Set API_BASE_URL to this URL for comparisons with the previous deployment.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalogue-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/
+            dist/
+          retention-days: 14
+          if-no-files-found: ignore

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+node_modules/
+.wrangler/
+dist/
+build/
+artifacts/
+.env
+.dev.vars
